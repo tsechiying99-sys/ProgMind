@@ -16,18 +16,21 @@
   - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
 """
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from mcp.tool_manager import MCPToolManager, Tool
+from tools.contracts import ToolExecutionContext
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,37 @@ class AgentType(Enum):
     EXPLAIN   = "explain"    # 讲解Agent
     QA = "qa"  # 答疑Agent
     QUIZ   = "quiz"    # 出题Agent
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """A role contract used for routing, prompting, and tool authorization."""
+
+    role: str
+    responsibilities: Tuple[str, ...]
+    workflow: Tuple[str, ...]
+    input_contract: Tuple[str, ...]
+    output_contract: Tuple[str, ...]
+    escalation_conditions: Tuple[str, ...]
+    tool_scope: Tuple[str, ...]
+    temperature: float = 0.2
+    max_tokens: int = 4096
+
+    def to_prompt_block(self) -> str:
+        def lines(values: Tuple[str, ...]) -> str:
+            return "\n".join(f"- {value}" for value in values) or "- 无"
+
+        return (
+            f"[结构化角色契约]\n"
+            f"角色：{self.role}\n"
+            f"职责：\n{lines(self.responsibilities)}\n"
+            f"处理流程：\n{lines(self.workflow)}\n"
+            f"可用输入：\n{lines(self.input_contract)}\n"
+            f"输出要求：\n{lines(self.output_contract)}\n"
+            f"升级条件：\n{lines(self.escalation_conditions)}\n"
+            f"工具权限：{', '.join(self.tool_scope) or '无'}\n"
+            "只能声称执行了实际返回结果的工具；资料不足时必须明确说明。"
+        )
 
 @dataclass
 class AgentStats:
@@ -70,6 +104,8 @@ class AgentResponse:
     confidence:  float = 1.0
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
+    tools_used:  List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -93,26 +129,48 @@ class OrchestratorResult:
     success: bool = True
     escalated:   bool  = False
     latency_ms:  float = 0.0
+    tools_used:  List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ── 基础 Agent ────────────────────────────────────────────────────────────────
 
 class BaseAgent:
-    """所有 Agent 的基类，封装 LLM 调用和统计。"""
+    """所有 Agent 的基类，封装角色契约、工具白名单、LLM 调用和统计。"""
 
     agent_type: AgentType
     system_prompt: str
+    profile: AgentProfile
 
-    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+        model: str,
+        skill_manager: Optional[Any] = None,
+        tool_manager: Optional[MCPToolManager] = None,
+        profile: Optional[AgentProfile] = None,
+    ):
         self._client = client
+        self.profile = profile or self.profile
         self._model  = model
         self._skill_manager = skill_manager
+        self._tool_manager = tool_manager
         self.stats   = AgentStats()
+        self._last_tools_used: List[str] = []
+        self._last_tool_traces: List[Dict[str, Any]] = []
+
+    def get_tools(self) -> Dict[str, Tool]:
+        """从统一管理器读取当前角色白名单内已注册的工具。"""
+        if self._tool_manager is None:
+            return {}
+        return self._tool_manager.get_tools(list(self.profile.tool_scope))
 
     async def handle(self, req: Request) -> AgentResponse:
         start_time = time.monotonic()
         succeeded = False
         content = ""
+        self._last_tools_used = []
+        self._last_tool_traces = []
         try:
             content = await self._call_llm(req)
             succeeded = True
@@ -132,30 +190,107 @@ class BaseAgent:
             success=succeeded,
             latency_ms=ms,
             escalate=escalate,
-            )
+            tools_used=list(self._last_tools_used),
+            tool_traces=list(self._last_tool_traces),
+        )
 
     async def _call_llm(self, req: Request) -> str:
-        resp = await self._client.messages.create(**self._llm_request(req))
-        content = extract_text_content(resp.content).strip()
+        """Execute a bounded Anthropic tool-use loop with server-side allowlisting."""
 
-        #进一步对content进行检验
-        if not content:
-            block_types = [
-                getattr(block, "type", type(block).__name__)
-                for block in (resp.content or [])
+        messages = self._build_messages(req)
+        tools = self.get_tools()
+        max_rounds = max(1, int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "3")))
+
+        for round_index in range(max_rounds + 1):
+            request_kwargs = self._llm_request(
+                req,
+                messages=messages,
+                include_tools=True,
+            )
+            resp = await self._client.messages.create(**request_kwargs)
+            blocks = list(resp.content or [])
+            tool_uses = [
+                block for block in blocks
+                if self._block_type(block) == "tool_use"
             ]
 
-            logger.error(
-                "LLM 返回空回答: stop_reason=%s, blocks=%s",
-                getattr(resp, "stop_reason", None),
-                block_types,
-            )
-            raise RuntimeError("LLM 返回了空回答")
+            if not tool_uses:
+                content = extract_text_content(blocks).strip()
+                if not content:
+                    block_types = [
+                        self._block_type(block) or type(block).__name__
+                        for block in blocks
+                    ]
+                    logger.error(
+                        "LLM 返回空回答: stop_reason=%s, blocks=%s",
+                        getattr(resp, "stop_reason", None),
+                        block_types,
+                    )
+                    raise RuntimeError("LLM 返回了空回答")
+                return content
 
-        return content
+            if round_index >= max_rounds:
+                raise RuntimeError(
+                    f"{self.agent_type.value} Agent 工具调用超过最大轮数 {max_rounds}"
+                )
 
-    def _llm_request(self, req: Request) -> Dict[str, Any]:
-        """统一构建普通调用和流式调用使用的模型参数。"""
+            messages.append({"role": "assistant", "content": blocks})
+            tool_results = []
+            for block in tool_uses:
+                name = str(self._block_value(block, "name") or "")
+                tool_use_id = str(self._block_value(block, "id") or "")
+                args = self._block_value(block, "input") or {}
+                tool = tools.get(name)
+                started_at = time.monotonic()
+                success = False
+                error = ""
+
+                if tool is None or self._tool_manager is None:
+                    error = f"工具不在 {self.agent_type.value} Agent 白名单中"
+                    result: Any = {"success": False, "error": error}
+                else:
+                    call_result = await self._tool_manager.call(
+                        name,
+                        args,
+                        context=ToolExecutionContext.from_request(req, self.agent_type),
+                    )
+                    success = call_result.success
+                    error = call_result.error or ""
+                    result = call_result.data if success else {
+                        "success": False,
+                        "error": error,
+                    }
+                    if success and name not in self._last_tools_used:
+                        self._last_tools_used.append(name)
+
+                if not error and isinstance(result, dict):
+                    error = str(result.get("error") or "")
+                self._last_tool_traces.append({
+                    "agent_type": self.agent_type.value,
+                    "tool_name": name,
+                    "tool_use_id": tool_use_id,
+                    "input": dict(args) if isinstance(args, dict) else args,
+                    "success": success,
+                    "latency_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        1,
+                    ),
+                    "error": error,
+                })
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "is_error": not success,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        raise RuntimeError("Agent 工具调用循环异常结束")
+
+    def _build_messages(self, req: Request) -> List[Dict[str, Any]]:
+        """Build a fresh message list shared by normal and streaming calls."""
+
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -164,16 +299,39 @@ class BaseAgent:
             messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
+        return messages
 
-        return {
+    def _llm_request(
+        self,
+        req: Request,
+        *,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        include_tools: bool = False,
+    ) -> Dict[str, Any]:
+        """Build model parameters and expose only the current role's allowlist."""
+
+        request_kwargs: Dict[str, Any] = {
             "model": self._model,
-            "max_tokens": int(os.getenv("AGENT_MAX_TOKENS", "4096")),
+            "max_tokens": self.profile.max_tokens,
+            "temperature": self.profile.temperature,
             "system": self._build_system_prompt(req),
-            "messages": messages,
+            "messages": messages if messages is not None else self._build_messages(req),
         }
+        tools = self.get_tools()
+        if include_tools and tools:
+            request_kwargs["tools"] = [
+                tool.to_model_schema()
+                for tool in tools.values()
+            ]
+        return request_kwargs
 
     async def stream(self, req: Request) -> AsyncIterator[str]:
-        """直接转发模型文本增量，并与普通调用共用 Agent 统计口径。"""
+        """Stream text using the same role contract.
+
+        Tool use is intentionally handled by the non-streaming execution path in
+        this focused change.  The stream remains behavior-compatible and never
+        receives tools that it cannot safely resolve mid-stream.
+        """
         start_time = time.monotonic()
         succeeded = False
         chunks: List[str] = []
@@ -195,13 +353,27 @@ class BaseAgent:
                 self.stats.success += 1
 
     def _build_system_prompt(self, req: Request) -> str:
-        """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
+        """Combine the structured role contract with dynamically loaded Skills."""
+
+        base_prompt = f"{self.system_prompt}\n\n{self.profile.to_prompt_block()}"
         if self._skill_manager is None:
-            return self.system_prompt
+            return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
         if not skill_prompt:
-            return self.system_prompt
-        return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
+            return base_prompt
+        return f"{base_prompt}\n\n[动态 Skills]\n{skill_prompt}"
+
+    @staticmethod
+    def _block_type(block: Any) -> Optional[str]:
+        if isinstance(block, dict):
+            return block.get("type")
+        return getattr(block, "type", None)
+
+    @staticmethod
+    def _block_value(block: Any, key: str) -> Any:
+        if isinstance(block, dict):
+            return block.get(key)
+        return getattr(block, key, None)
 
     def _needs_escalation(self, content: str) -> bool:
         """检测回答是否建议教师介入。"""
@@ -216,37 +388,115 @@ class BaseAgent:
 
 class ExplainAgent(BaseAgent):
     agent_type    = AgentType.EXPLAIN
-    system_prompt = (
-        "你是学习讲解 Agent。"
-        "根据学生当前学习进度和薄弱点讲解知识。"
-        "优先依据提供的课程资料，不要编造课程内容。"
-        "先解释核心概念，再给一个简单示例，最后用一个小问题检查理解。"
-        "控制一次回复的新知识数量，避免使用学生尚未学习的高级概念。"
+    system_prompt = "你是 ProgMind 的学习讲解 Agent，必须以课程资料和明确上下文为依据。"
+    profile = AgentProfile(
+        role="课程知识讲解者",
+        responsibilities=(
+            "根据学生当前进度和薄弱点解释知识",
+            "优先依据课程资料，区分资料结论与通用补充",
+            "控制单次新增概念数量并检查学生理解",
+        ),
+        workflow=(
+            "识别需要讲解的核心知识点",
+            "检查必要的前置知识",
+            "按概念、示例、理解检查的顺序组织回答",
+        ),
+        input_contract=(
+            "学生当前问题",
+            "最近对话和学习画像上下文",
+            "已检索的课程资料",
+        ),
+        output_contract=(
+            "先解释核心概念",
+            "提供一个难度适中的简单示例",
+            "最后提出一个简短的理解检查问题",
+        ),
+        escalation_conditions=(
+            "课程资料不足以支持确定结论",
+            "学生连续多轮仍无法理解且需要教师介入",
+        ),
+        tool_scope=(
+            "check_prerequisites",
+        ),
+        temperature=0.2,
+        max_tokens=4096,
     )
-
 
 class QaAgent(BaseAgent):
     agent_type    = AgentType.QA
-    system_prompt = (
-        "你是学习答疑 Agent。"
-        "先判断学生具体卡在哪一步，再进行针对性解释。"
-        "如果学生正在完成练习，优先给提示、思路和检查方向，"
-        "不要立即给出完整答案。"
-        "如果信息不足，先提出一个最关键的澄清问题。"
-        "优先依据课程资料回答，并明确区分资料内容和补充解释。"
+    system_prompt = "你是 ProgMind 的学习答疑 Agent，优先定位卡点并提供渐进提示。"
+    profile = AgentProfile(
+        role="学习问题诊断与答疑者",
+        responsibilities=(
+            "判断学生具体卡在哪一步",
+            "提供提示、推理方向和检查方法",
+            "避免在练习过程中直接泄露完整答案",
+        ),
+        workflow=(
+            "识别问题和学生已尝试的步骤",
+            "定位第一个关键卡点",
+            "按由弱到强的顺序提供提示",
+            "信息不足时只询问一个最关键的澄清问题",
+        ),
+        input_contract=(
+            "学生的问题或报错",
+            "学生已经尝试的步骤",
+            "最近对话、学习画像和课程资料",
+        ),
+        output_contract=(
+            "先指出卡点",
+            "给出可执行的下一步提示",
+            "明确区分课程资料与通用解释",
+        ),
+        escalation_conditions=(
+            "问题依赖未提供的课程或环境信息",
+            "可能涉及需要教师判断的作业规范",
+        ),
+        tool_scope=(
+            "build_hint_plan",
+        ),
+        temperature=0.15,
+        max_tokens=4096,
     )
-
 
 class QuizAgent(BaseAgent):
     agent_type    = AgentType.QUIZ
-    system_prompt = (
-        "你是练习出题 Agent。"
-        "根据学生已学内容和薄弱点生成一道难度适中的题目。"
-        "题目必须注明考查知识点和难度。"
-        "默认只输出题目，不同时泄露答案。"
-        "只有学生提交答案或明确要求答案后，才进行评分和讲解。"
+    system_prompt = "你是 ProgMind 的练习出题 Agent，默认只出一道题且不泄露答案。"
+    profile = AgentProfile(
+        role="个性化练习设计者",
+        responsibilities=(
+            "根据已学内容和薄弱点设计练习",
+            "控制题目难度和考查范围",
+            "在学生作答前隐藏答案和完整解法",
+        ),
+        workflow=(
+            "确定考查知识点",
+            "结合上下文确定难度和题型",
+            "生成一道边界清晰的题目",
+            "等待学生提交答案后再评分或讲解",
+        ),
+        input_contract=(
+            "目标知识点",
+            "学习进度和薄弱点上下文",
+            "题型或难度偏好",
+        ),
+        output_contract=(
+            "注明考查知识点和难度",
+            "默认只输出一道题",
+            "学生作答前不得同时输出答案或完整解法",
+        ),
+        escalation_conditions=(
+            "课程资料没有覆盖指定知识点",
+            "用户要求违反课程或考试规则的内容",
+        ),
+        tool_scope=(
+            "search_question_bank",
+            "grade_answer",
+            "record_learning_result",
+        ),
+        temperature=0.35,
+        max_tokens=3072,
     )
-
 
 # ── 编排器 ────────────────────────────────────────────────────────────────────
 
@@ -276,6 +526,7 @@ class AgentOrchestrator:
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
+        tool_manager: Optional[MCPToolManager] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -284,12 +535,13 @@ class AgentOrchestrator:
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._skill_manager = skill_manager
+        self._tool_manager = tool_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.EXPLAIN:   [ExplainAgent(client, model, skill_manager)],
-            AgentType.QA: [QaAgent(client, model, skill_manager)],
-            AgentType.QUIZ:   [QuizAgent(client, model, skill_manager)],
+            AgentType.EXPLAIN: [ExplainAgent(client, model, skill_manager, tool_manager)],
+            AgentType.QA: [QaAgent(client, model, skill_manager, tool_manager)],
+            AgentType.QUIZ: [QuizAgent(client, model, skill_manager, tool_manager)],
         }
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
@@ -298,6 +550,13 @@ class AgentOrchestrator:
         for agents in self._pool.values():
             for agent in agents:
                 agent._skill_manager = skill_manager
+
+    def set_tool_manager(self, tool_manager: Optional[MCPToolManager]) -> None:
+        """更新统一工具管理器，主要供测试替换和运行时重载。"""
+        self._tool_manager = tool_manager
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._tool_manager = tool_manager
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
@@ -340,6 +599,8 @@ class AgentOrchestrator:
             success=response.success,
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
+            tools_used=list(response.tools_used),
+            tool_traces=list(response.tool_traces),
         )
 
     async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
@@ -365,6 +626,16 @@ class AgentOrchestrator:
 
         combined = "\n\n".join(parts) if parts else "抱歉，所有 Agent 均处理失败。"
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        tools_used = list(dict.fromkeys(
+            tool_name
+            for response in successful_responses
+            for tool_name in response.tools_used
+        ))
+        tool_traces = [
+            trace
+            for response in successful_responses
+            for trace in response.tool_traces
+        ]
 
         return OrchestratorResult(
             request_id=req.request_id,
@@ -375,6 +646,8 @@ class AgentOrchestrator:
             success=bool(successful_responses),
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
+            tools_used=tools_used,
+            tool_traces=tool_traces,
         )
 
     async def stream(self, req: Request) -> AsyncIterator[Dict[str, Any]]:

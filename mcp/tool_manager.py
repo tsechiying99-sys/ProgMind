@@ -1,6 +1,4 @@
 """
-亮点：MCP 工具调用框架
-
 核心问题：工具调用出错（检索不全、召回不好）怎么优化？
 
 本模块的答案：
@@ -14,6 +12,7 @@
 """
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import time
@@ -124,10 +123,19 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    read_only:   bool = True                 # 供审计和后续权限策略使用
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker, init=False)
+
+    def to_model_schema(self) -> Dict[str, Any]:
+        """转换为 Anthropic tool-use 所需的公开定义。"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.schema,
+        }
 
 
 # ── MCP 工具管理器 ────────────────────────────────────────────────────────────
@@ -151,12 +159,31 @@ class MCPToolManager:
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: Tool, *, replace: bool = False) -> None:
+        if tool.name in self._tools and not replace:
+            raise ValueError(f"工具已注册: {tool.name}")
         self._tools[tool.name] = tool
         logger.info(f"注册工具: {tool.name}")
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+
+    def get_tool(self, name: str) -> Optional[Tool]:
+        """只读获取已注册工具，避免调用方访问内部字典。"""
+        return self._tools.get(name)
+
+    def get_tools(self, names: Optional[List[str]] = None) -> Dict[str, Tool]:
+        """获取指定工具；省略 names 时返回全部已注册工具的浅拷贝。"""
+        if names is None:
+            return dict(self._tools)
+        return {name: self._tools[name] for name in names if name in self._tools}
+
+    def get_tool_schemas(self, names: List[str]) -> List[Dict[str, Any]]:
+        return [tool.to_model_schema() for tool in self.get_tools(names).values()]
+
+    @property
+    def registered_names(self) -> Tuple[str, ...]:
+        return tuple(self._tools)
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
@@ -164,7 +191,7 @@ class MCPToolManager:
         self,
         name: str,
         params: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None,
+        context: Any = None,
         *,
         use_cache: bool = True,
         rerank_top_k: int = 0,          # >0 时对结果重排，取 Top-K
@@ -176,6 +203,12 @@ class MCPToolManager:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+
+        # 调用方输入错误不是工具故障：不应触发 fallback、失败计数或熔断器。
+        try:
+            self._validate_params(tool, params)
+        except (TypeError, ValueError) as ex:
+            return ToolResult(success=False, data=None, tool_name=name, error=str(ex))
 
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
 
@@ -202,10 +235,10 @@ class MCPToolManager:
         t0 = time.monotonic()
         tool.stats.total += 1
         try:
-            # 参数校验（根据 JSON Schema 的 required 和 properties.type）
-            self._validate_params(tool, params)
-
-            data = await asyncio.wait_for(tool.handler(params, context), timeout=tool.timeout_s)
+            data = await asyncio.wait_for(
+                self._run_handler(tool.handler, params, context),
+                timeout=tool.timeout_s,
+            )
             latency = (time.monotonic() - t0) * 1000
 
             tool.stats.success += 1
@@ -244,7 +277,7 @@ class MCPToolManager:
         self,
         tool: Tool,
         params: Dict[str, Any],
-        context: Optional[Dict[str, Any]],
+        context: Any,
         error: str,
     ) -> ToolResult:
         """工具不可用时返回降级结果，而不是把空错误直接暴露给调用方。"""
@@ -263,6 +296,16 @@ class MCPToolManager:
         except Exception as ex:
             logger.error(f"工具降级失败: {tool.name} — {ex}")
             return ToolResult(success=False, data=None, tool_name=tool.name, error=f"{error}; fallback失败: {ex}")
+
+    @staticmethod
+    async def _run_handler(handler: Callable, params: Dict[str, Any], context: Any) -> Any:
+        """统一执行同步/异步 handler；同步 I/O 不阻塞事件循环。"""
+        if inspect.iscoroutinefunction(handler):
+            return await handler(params, context)
+        result = await asyncio.to_thread(handler, params, context)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     # ── 查询改写（解决召回不全）────────────────────────────────────────────────
 
@@ -345,7 +388,7 @@ class MCPToolManager:
         tool_name: str,
         query: str,
         top_k: int = 5,
-        context: Optional[Dict[str, Any]] = None,
+        context: Any = None,
     ) -> ToolResult:
         """
         完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
@@ -509,6 +552,9 @@ class MCPToolManager:
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
         """根据工具的 JSON Schema 校验参数，不合法时抛出 ValueError。"""
+        if not isinstance(params, dict):
+            raise ValueError(f"工具 {tool.name} 参数必须是 JSON 对象")
+
         schema = tool.schema
         required = schema.get("required", [])
         properties = schema.get("properties", {})
@@ -517,14 +563,47 @@ class MCPToolManager:
             if field not in params:
                 raise ValueError(f"工具 {tool.name} 缺少必需参数: {field}")
 
+        unknown = set(params) - set(properties)
+        if unknown and schema.get("additionalProperties") is False:
+            raise ValueError(f"工具 {tool.name} 不允许参数: {', '.join(sorted(unknown))}")
+
         for key, value in params.items():
-            if key in properties:
-                expected_type = properties[key].get("type")
-                if expected_type and expected_type in self._TYPE_MAP:
-                    if not isinstance(value, self._TYPE_MAP[expected_type]):
-                        raise ValueError(
-                            f"工具 {tool.name} 参数 {key} 类型错误: 期望 {expected_type}，实际 {type(value).__name__}"
-                        )
+            field_schema = properties.get(key)
+            if field_schema:
+                self._validate_value(tool.name, key, value, field_schema)
+
+    def _validate_value(
+        self,
+        tool_name: str,
+        field_name: str,
+        value: Any,
+        schema: Dict[str, Any],
+    ) -> None:
+        expected_name = schema.get("type")
+        expected_type = self._TYPE_MAP.get(expected_name)
+        if expected_type is not None:
+            if expected_name in {"number", "integer"} and isinstance(value, bool):
+                raise ValueError(f"工具 {tool_name} 参数 {field_name} 类型错误: 期望 {expected_name}")
+            if not isinstance(value, expected_type):
+                raise ValueError(
+                    f"工具 {tool_name} 参数 {field_name} 类型错误: 期望 {expected_name}，实际 {type(value).__name__}"
+                )
+
+        if "enum" in schema and value not in schema["enum"]:
+            raise ValueError(f"工具 {tool_name} 参数 {field_name} 不在允许值中")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in schema and value < schema["minimum"]:
+                raise ValueError(f"工具 {tool_name} 参数 {field_name} 小于最小值 {schema['minimum']}")
+            if "maximum" in schema and value > schema["maximum"]:
+                raise ValueError(f"工具 {tool_name} 参数 {field_name} 大于最大值 {schema['maximum']}")
+        if isinstance(value, str):
+            if "minLength" in schema and len(value) < schema["minLength"]:
+                raise ValueError(f"工具 {tool_name} 参数 {field_name} 过短")
+            if "maxLength" in schema and len(value) > schema["maxLength"]:
+                raise ValueError(f"工具 {tool_name} 参数 {field_name} 过长")
+        if isinstance(value, list) and isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                self._validate_value(tool_name, f"{field_name}[{index}]", item, schema["items"])
 
     @staticmethod
     def _clean_text(value: Any) -> str:

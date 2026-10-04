@@ -4,7 +4,7 @@ RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB
   2. 语义检索：根据 query 从知识库中检索最相关的文档片段
-  3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
+  3. 提供统一 search_handler，供聊天 RAG 预处理和题目检索工具复用
 
 ChromaDB 在这里的角色：
   - memory/ 中用于存储对话记忆（情景记忆 + 用户画像）

@@ -48,6 +48,7 @@ BANNER = r"""
 _orchestrator = None
 _memory       = None
 _tool_manager = None
+_knowledge_base = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
@@ -68,7 +69,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _knowledge_base, _monitor, _evaluator, _skill_manager
 
     print(BANNER, flush=True)
 
@@ -76,10 +77,11 @@ async def lifespan(app: FastAPI):
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from mcp.tool_manager import MCPToolManager
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from tools import ToolDependencies, register_learning_tools
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -99,14 +101,6 @@ async def lifespan(app: FastAPI):
     )
     _skill_manager.load()
 
-    # Agent 编排器
-    _orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        skill_manager=_skill_manager,
-    )
-
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
     _memory = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
@@ -124,39 +118,28 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
-    kb = KnowledgeBase(
+    _knowledge_base = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
     )
-    logger.info(f"知识库已加载: {kb.doc_count} 个文档片段")
+    logger.info(f"知识库已加载: {_knowledge_base.doc_count} 个文档片段")
+    register_learning_tools(
+        _tool_manager,
+        ToolDependencies(
+            knowledge_base=_knowledge_base,
+            memory_manager=_memory,
+        ),
+    )
 
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
-
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
+    # Agent 只通过 MCPToolManager 获取和执行白名单工具。
+    _orchestrator = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        skill_manager=_skill_manager,
+        tool_manager=_tool_manager,
+    )
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -493,13 +476,65 @@ def _sse_event(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+async def _search_course_knowledge(
+    query: str,
+    top_k: int,
+    *,
+    enhanced: bool = False,
+) -> List[Dict[str, Any]]:
+    """Normal chat RAG service; it is deliberately not exposed as an Agent tool."""
+    if _knowledge_base is None:
+        return []
+
+    queries = [query]
+    if enhanced and _tool_manager is not None:
+        rewritten = await _tool_manager.rewrite_query(query, n=3)
+        queries = list(dict.fromkeys([query, *rewritten]))
+
+    recall_k = max(top_k, 5)
+    tasks = [
+        _knowledge_base.search_handler(
+            {
+                "query": current_query,
+                "top_k": recall_k,
+                "retrieval_mode": "hybrid" if index == 0 else "dense",
+            },
+            None,
+        )
+        for index, current_query in enumerate(queries)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for result in results:
+        if isinstance(result, Exception) or not isinstance(result, list):
+            continue
+        for item in result:
+            if not isinstance(item, dict) or not str(item.get("content", "")).strip():
+                continue
+            key = (
+                str(item.get("title", "")),
+                str(item.get("content", "")),
+                item.get("chunk", 0),
+            )
+            previous = merged.get(key)
+            if previous is None or float(item.get("score", 0.0)) > float(previous.get("score", 0.0)):
+                merged[key] = item
+
+    return sorted(
+        merged.values(),
+        key=lambda item: float(item.get("fusion_score", item.get("score", 0.0))),
+        reverse=True,
+    )[:top_k]
+
+
 async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, bool]:
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
+    知识库属于固定预处理流程，不作为模型可自主调用的 Agent 工具。
     """
-    if _tool_manager is None:
+    if _knowledge_base is None:
         return "", False
     if not _should_use_knowledge(message):
         return "", False
@@ -507,24 +542,16 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         # 对话链路默认使用单次向量检索，避免查询改写和重排额外产生两次 LLM
         # 请求。需要更高召回率时可设置 CHAT_RAG_MODE=enhanced 恢复完整链路。
         if os.getenv("CHAT_RAG_MODE", "fast").strip().lower() == "enhanced":
-            result = await _tool_manager.search_with_rewrite(
-                "knowledge_search", message, top_k=top_k
-            )
+            items = await _search_course_knowledge(message, top_k, enhanced=True)
         else:
-            result = await _tool_manager.call(
-                "knowledge_search",
-                {"query": message, "top_k": top_k},
-                use_cache=True,
-            )
+            items = await _search_course_knowledge(message, top_k)
 
         # 快速检索没有命中时，才执行查询改写，提高召回率。
         fallback_enabled = (os.getenv("CHAT_RAG_FALLBACK_ENHANCED","true",)
                             .strip().lower() in {"1", "true", "yes", "on"})
 
         fast_result_empty = (
-                not result.success
-                or not isinstance(result.data, list)
-                or not result.data
+                not items
         )
 
         if fallback_enabled and fast_result_empty:
@@ -532,16 +559,12 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
                 "RAG 快速检索无结果，启用增强检索: query=%r",
                 message,
             )
-            result = await _tool_manager.search_with_rewrite(
-                "knowledge_search",
-                message,
-                top_k=top_k,
-            )
+            items = await _search_course_knowledge(message, top_k, enhanced=True)
 
         parts = ["[知识库检索结果]"]
         seen = set()
         used = False
-        for item in result.data:
+        for item in items:
             if not isinstance(item, dict):
                 continue
             # 降级结果不能算成功使用知识库
@@ -608,8 +631,9 @@ async def search(query: str, top_k: int = 5):
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    top_k = max(1, min(top_k, 8))
+    results = await _search_course_knowledge(query, top_k, enhanced=True)
+    return {"query": query, "results": results, "reranked": True}
 
 
 class DocInput(BaseModel):
@@ -690,13 +714,11 @@ async def add_knowledge(body: BatchDocInput):
     }
     ```
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
+    if _knowledge_base is None or _tool_manager is None:
         raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
-    _tool_manager.clear_cache("knowledge_search")
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+    count = _knowledge_base.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    _tool_manager.clear_cache("search_question_bank")
+    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": _knowledge_base.doc_count}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -710,10 +732,8 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     文件大小限制：10MB
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
+    if _knowledge_base is None or _tool_manager is None:
         raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
 
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
@@ -735,23 +755,21 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = kb.add_documents(docs)
-    _tool_manager.clear_cache("knowledge_search")
+    count = _knowledge_base.add_documents(docs)
+    _tool_manager.clear_cache("search_question_bank")
     return {
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
-        "total_chunks": kb.doc_count,
+        "total_chunks": _knowledge_base.doc_count,
     }
 
 
 @app.get("/knowledge/stats", tags=["知识库"])
 async def knowledge_stats():
     """查看知识库统计信息（文档片段总数）。"""
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
+    if _knowledge_base is None:
         raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
-    return {"total_chunks": kb.doc_count}
+    return {"total_chunks": _knowledge_base.doc_count}
 
 
 @app.post("/eval/run")

@@ -1,5 +1,236 @@
 # 修改日志
 
+## 2026-09-22
+
+### 本次目标与实施边界
+
+按“工具拆分与统一入口 → 消除重复定义 → 接入真实能力”的推荐顺序实施到第三阶段。本节内容取代 2026-09-21 日志中关于 `agents/tools.py`、`AgentToolSpec` 和 `knowledge_search` 适配器的现状说明；结构化 Agent 角色设计继续保留。
+
+本次修改仍只保留在本地工作区，**没有提交或推送到 GitHub**。修改前的远端基线仍为 `main` 分支提交 `2ab732d Establish learning assistant baseline`。未修改或删除 `output/` 中的用户生成文件。
+
+### 第一阶段：拆分工具并建立统一注册入口
+
+- 删除集中式 `agents/tools.py`，新增根目录 `tools/` 包。
+- 最终只保留 5 个非重复的 Agent 工具，每个工具使用独立模块：
+  - `check_prerequisites.py`
+  - `build_hint_plan.py`
+  - `search_question_bank.py`
+  - `grade_answer.py`
+  - `record_learning_result.py`
+- 新增 `tools/contracts.py`：
+  - `ToolExecutionContext` 统一传递 `request_id`、`user_id`、`conv_id`、Agent 类型、意图、紧急程度和脱敏后的请求上下文。
+  - `ToolDependencies` 显式注入知识库和记忆管理器，工具模块不读取 API 全局变量。
+  - `object_schema()` 统一生成 `additionalProperties: false` 的严格对象 Schema。
+- 新增 `tools/registry.py`，由 `register_learning_tools()` 在应用启动时一次性显式注册工具；导入模块不会产生注册副作用。
+
+### 第二阶段：由 MCPToolManager 唯一管理定义、权限校验和执行
+
+- 移除 `AgentToolSpec` 及 Agent 内部的 `_role_tools()`、`set_shared_tools()` 和直接 Handler 调用。
+- `mcp/tool_manager.Tool` 现在是唯一工具定义，新增：
+  - `to_model_schema()`：生成发送给模型的工具定义。
+  - `read_only`：标识工具是否会写数据，便于审计及后续策略扩展。
+- `MCPToolManager` 新增公开查询接口：
+  - `get_tool()`
+  - `get_tools()`
+  - `get_tool_schemas()`
+  - `registered_names`
+- 重复注册默认抛出错误，必须显式传入 `replace=True` 才能覆盖，避免同名工具静默替换。
+- 工具管理器统一执行同步和异步 Handler；同步 Handler 放入线程运行，避免阻塞事件循环。
+- 参数校验统一收口到工具管理器，支持：
+  - 必填参数和未知参数检查
+  - string、number、integer、boolean、array、object 类型检查
+  - 阻止 `bool` 冒充 integer/number
+  - enum、minimum、maximum、minLength、maxLength
+  - 数组元素的递归类型检查
+- 无效参数被视为调用方错误，不触发工具 fallback、失败计数或熔断器。
+- `BaseAgent` 只从管理器读取 `AgentProfile.tool_scope` 声明的工具；模型伪造未授权工具名时仍在服务端拒绝。
+- 所有实际工具调用统一经过 `MCPToolManager.call()`，因此超时、缓存、熔断、降级、统计和参数校验只有一套实现。
+
+### 最终架构：固定预处理与 Agent 工具分离
+
+- 删除 `knowledge_search` 和 `search_course_material` 两个工具注册名，不再把普通课程 RAG 暴露给 Agent。
+- `/chat` 和 `/chat/stream` 在 Agent 执行前，通过 `_search_course_knowledge()` 直接调用 `KnowledgeBase.search_handler()`；Memory 仍由 `_prepare_chat_request()` 统一预加载。
+- 快速 RAG 使用一次 Hybrid 检索；增强 RAG 使用查询改写、并行召回、文档去重和按融合分数排序。
+- `/search` 复用相同的增强 RAG 服务函数。
+- `MCPToolManager` 只管理模型可以自主选择的 5 个 Agent 工具，消除预加载 Memory/RAG 后再次调用同类工具的重复路径。
+- `search_question_bank` 仍复用 KnowledgeBase，但用途是按题目标记筛选练习材料，不等同于普通课程 RAG。
+- API 使用内部 `_knowledge_base` 引用处理课程检索、导入和统计，不再访问 `_tool_manager._tools` 或 `handler.__self__`。
+
+### 第三阶段：保留非重复的真实能力
+
+- `check_prerequisites`：为 Explain Agent 提供前置知识检查规则。
+- `build_hint_plan`：为 QA Agent 提供渐进提示规则。
+- `search_question_bank`：只在现有课程知识库检索结果中筛选明确带有“题目、习题、练习、quiz、question”标记的内容。项目当前没有独立题库，因此没有伪造题库服务；无匹配时明确返回空结果和 `configured=false`。
+- `grade_answer`：使用确定性规则评分：
+  - 提供 `key_points` 时计算关键点覆盖率。
+  - 未提供关键点时计算规范化文本相似度。
+  - 返回分数、是否通过、命中点、缺失点和评分方法，并声明开放题仍需教师复核。
+- `record_learning_result`：把已完成练习的知识点、题目、学生答案、分数、正确性和反馈写入 Memory。
+- `MemoryManager` 新增公开方法：
+  - `record_learning_result()`：Redis 中按用户保存最近 100 条，TTL 为 30 天。
+- 删除 `inspect_learning_context`、`build_quiz_constraints`、`search_course_material`、`get_learning_profile`、`get_course_progress`、`get_recent_mistakes` 六个工具模块。
+- 画像、进度、最近对话、会话摘要和课程资料继续由固定预处理流程一次性注入 Agent 上下文。
+
+### Agent 工具权限调整
+
+- Explain Agent：仅 `check_prerequisites`。
+- QA Agent：仅 `build_hint_plan`。
+- Quiz Agent：仅 `search_question_bank`、`grade_answer`、`record_learning_result`。
+- 写工具 `record_learning_result` 仅对 Quiz Agent 开放，其余角色不可见且无法通过伪造名称执行。
+
+### 启动顺序调整
+
+`api/main.py` 的生命周期初始化顺序改为：
+
+1. 加载 Skills。
+2. 初始化 MemoryManager。
+3. 初始化 MCPToolManager 和 KnowledgeBase。
+4. 使用依赖对象注册全部学习工具。
+5. 创建 AgentOrchestrator，并注入同一个 MCPToolManager。
+6. 启动 Monitor 和 Evaluator。
+
+这样可以保证 Agent 创建时已拥有完整、唯一的工具注册表。
+
+### 测试与验证
+
+- 更新 `tests/test_agent_profiles.py`：验证三类角色契约、工具范围和越权工具隔离。
+- 更新 `tests/test_agent_tools.py`：验证模型可见白名单、服务端越权拒绝、参数错误拒绝、工具轮数限制，以及已删除上下文工具不再注册。
+- 新增 `tests/test_tool_manager.py`：验证注册表恰好包含 5 个工具、重复注册保护、同步/异步统一调用、评分与学习结果记录、递归参数校验和数值边界。
+- 新增 `tests/test_chat_rag.py`：验证普通课程 RAG 脱离 Agent 工具后，快速检索和增强检索仍可直接调用 KnowledgeBase，并正确合并去重结果。
+- 验证命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall agents api mcp memory tools tests
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -c "import api.main; from tools import register_learning_tools; print('imports-ok')"
+```
+
+- 验证结果：Python 编译通过，API 与工具包导入通过，15 个单元测试全部通过。
+- 测试使用 Fake KnowledgeBase、Fake Memory 和 Fake LLM Client，不需要真实 Anthropic、Redis 或 ChromaDB 服务。
+
+### 当前明确边界
+
+- 流式 `/chat/stream` 仍沿用文本流，不在流中执行工具；普通 `/chat` 支持完整工具调用循环。
+- `search_question_bank` 复用课程知识库并诚实筛选题目标记，不等同于独立题库。以后接入真实题库时只需替换该工具 Handler，不需要改 Agent。
+- `grade_answer` 是可复现的初步评分规则，不是语义评阅模型，不适合单独决定复杂开放题成绩。
+- 本次没有新增第三方依赖，也没有更改前端接口 Schema。
+
+## 2026-09-21
+
+### 修改前 GitHub 基线
+
+- 在本次 Agent 改造开始前，将当前学习助手代码提交为 `2ab732d Establish learning assistant baseline`。
+- 基线已推送到 `https://github.com/tsechiying99-sys/EchoMind` 的 `main` 分支。
+- `.env`、`.venv`、`node_modules`、前端构建产物和 `output/` 生成文件未包含在基线提交中。
+- 本节以下修改仅保留在本地工作区，暂未提交或推送到 GitHub。
+
+### 修改范围
+
+本次严格围绕两项目标实施：
+
+1. 将 Explain、QA、Quiz Agent 从“不同 System Prompt”升级为结构化角色。
+2. 引入模型可见范围、服务端执行范围和参数 Schema 三层一致的 Agent 工具白名单。
+
+业务范围外的 Memory、混合 RAG 算法、Evaluator、Monitor、Skills 和前端均未修改。涉及文件：
+
+- 修改 `agents/agent_orchestrator.py`
+- 新增 `agents/tools.py`
+- 小改 `api/main.py`
+- 新增 `tests/test_agent_profiles.py`
+- 新增 `tests/test_agent_tools.py`
+- 更新本修改日志 `CHANGELOG.md`
+
+### 1. Agent 结构化角色契约
+
+- 新增不可变数据结构 `AgentProfile`，包含：
+  - `role`：角色定位
+  - `responsibilities`：职责列表
+  - `workflow`：确定性处理流程
+  - `input_contract`：允许使用的输入
+  - `output_contract`：最终回答必须满足的输出约束
+  - `escalation_conditions`：需要教师或外部确认的条件
+  - `tool_scope`：角色允许使用的工具名
+  - `temperature`、`max_tokens`：角色级生成参数
+- `BaseAgent._build_system_prompt()` 现在统一注入结构化角色契约，再追加已有动态 Skills。
+- `ExplainAgent` 的处理契约固定为“识别知识点 → 检查前置知识 → 概念讲解 → 示例 → 理解检查”。
+- `QaAgent` 的处理契约固定为“识别已尝试步骤 → 定位首个卡点 → 渐进提示 → 必要时提出一个澄清问题”。
+- `QuizAgent` 的处理契约固定为“确定知识点 → 规范难度和题型 → 只生成一道题 → 学生作答前隐藏答案与解法”。
+- 三类 Agent 使用不同的温度、最大输出和工具范围，不再只依靠 Prompt 文案体现角色差异。
+
+### 2. Agent 工具定义与白名单
+
+- 新增 `AgentToolSpec`，将工具名、说明、严格 JSON Schema 和可信 Handler 绑定为一个不可变定义。
+- 所有工具 Schema 默认设置 `additionalProperties: false`，禁止模型添加未声明参数。
+- `BaseAgent.get_tools()` 只返回“实际已注册工具”和 `AgentProfile.tool_scope` 的交集。
+- 模型请求的 `tools` 参数仅包含当前 Agent 可见工具，其他角色工具不会发送给模型。
+- 模型即使伪造未授权工具名，服务端仍会拒绝执行，并以失败的 `tool_result` 返回模型。
+- 执行前校验：
+  - 参数必须为 JSON 对象
+  - 所有必填字段必须存在
+  - 不允许未知字段
+  - 校验 string、number、integer、boolean、array、object 基础类型
+  - 防止 Python `bool` 被错误当作 number/integer
+- 工具调用循环受 `AGENT_MAX_TOOL_ROUNDS` 限制，默认最多 3 轮，防止模型无限调用工具。
+- `AgentResponse` 和 `OrchestratorResult` 新增内部 `tools_used` 与 `tool_traces`，但暂未改变公开 `/chat` 响应结构。
+
+### 3. 当前工具清单
+
+Explain Agent：
+
+- `inspect_learning_context`：只返回上下文是否存在、历史轮数等脱敏状态。
+- `check_prerequisites`：生成保守的前置知识检查清单，不断言学生已掌握。
+- `search_course_material`：只读检索现有课程知识库。
+
+QA Agent：
+
+- `inspect_learning_context`
+- `build_hint_plan`：生成由弱到强的提示方案，默认不泄露完整答案。
+- `search_course_material`
+
+Quiz Agent：
+
+- `inspect_learning_context`
+- `build_quiz_constraints`：规范知识点、难度和题型，并强制隐藏答案和解法。
+- `search_course_material`
+
+### 4. 复用现有课程知识库
+
+- `api/main.py` 在现有 `knowledge_search` 注册完成后创建 `search_course_material` 适配器，并注入 Orchestrator。
+- 新工具继续调用现有 `MCPToolManager.call()`，因此保留已有参数校验、超时、熔断、缓存和降级机制。
+- 未修改 `mcp/knowledge_base.py`，BGE、BM25 和混合融合排序保持原样。
+- 未移除 API 层已有的课程资料预检索。普通 `/chat` 中 Agent 可在现有上下文不足时追加调用课程检索；相同查询继续受 ToolManager 缓存保护。
+
+### 5. 兼容性与明确边界
+
+- `/chat` 请求和响应 Schema 保持不变，现有前端不需要同步修改。
+- `/chat` 普通调用已支持真实模型 tool-use 循环。
+- `/chat/stream` 继续使用原有直接文本流和结构化角色 Prompt，但本次没有加入流中工具调用；这是为了把修改严格限制在指定两项并避免改变 SSE 协议。流式工具循环可作为独立后续任务处理。
+- 工具均为只读分析或检索工具，不提供知识库写入、画像写入、文件操作或任意代码执行能力。
+- 本次没有引入新的第三方依赖。
+
+### 6. 自动化验证
+
+- 新增 10 个基于标准库 `unittest` 的测试，不依赖 pytest：
+  - 三类 Agent 具有不同的结构化角色契约。
+  - 每个 Profile 均包含职责、流程、输入、输出和升级条件。
+  - 角色级温度和最大输出参数确实不同。
+  - System Prompt 包含结构化契约与工具权限。
+  - 三类 Agent 的本地工具范围相互隔离。
+  - 共享课程检索只有在声明并注入后才可见。
+  - 模型只收到当前 Agent 白名单内的工具定义。
+  - 伪造的越权工具调用会被服务端拒绝。
+  - 未声明字段和错误参数类型会被拒绝。
+  - 工具调用达到配置轮数后会终止，不会无限循环。
+  - 课程检索适配器能够复用现有 `knowledge_search`。
+- 验证命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m py_compile agents\agent_orchestrator.py agents\tools.py api\main.py tests\test_agent_profiles.py tests\test_agent_tools.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+- 验证结果：10 个测试全部通过。
+
 ## 2026-08-22
 
 ### 前端流式输出

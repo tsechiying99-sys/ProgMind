@@ -216,6 +216,31 @@ class MemoryManager:
     async def get_profile(self, user_id: str) -> Dict[str,Any]:
         return await self._get_profile(user_id)
 
+    async def record_learning_result(
+        self,
+        user_id: str,
+        conv_id: str,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """持久化一次已完成练习的结构化结果，供进度和错题工具读取。"""
+        user_id = self._safe_text(user_id)
+        conv_id = self._safe_text(conv_id)
+        clean_result = self._safe_metadata_value(result)
+        timestamp = datetime.now().isoformat()
+        record = {
+            "id": hashlib.md5(
+                f"{user_id}:{conv_id}:{timestamp}:{json.dumps(clean_result, sort_keys=True, ensure_ascii=False)}".encode()
+            ).hexdigest(),
+            "user_id": user_id,
+            "conv_id": conv_id,
+            "recorded_at": timestamp,
+            **clean_result,
+        }
+        key = self._learning_results_key(user_id)
+        self._redis.lpush(key, json.dumps(record, ensure_ascii=False))
+        self._redis.ltrim(key, 0, 99)
+        self._redis.expire(key, 30 * 86400)
+        return {"saved": True, "record": record}
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -372,6 +397,10 @@ class MemoryManager:
     @staticmethod
     def _summary_key(user_id: str, conv_id: str) -> str:
         return f"summary:{user_id}:{conv_id}"
+
+    @staticmethod
+    def _learning_results_key(user_id: str) -> str:
+        return f"learning_results:{user_id}"
 
     @staticmethod
     def _safe_text(value: Any) -> str:
