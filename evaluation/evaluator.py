@@ -894,12 +894,18 @@ class EndToEndEvaluator:
 
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
+from evaluation.default_cases import JAVA_20_TURN_DIALOG, JAVA_INTENT_CASE_DATA
+
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
     IntentTestCase("请给我讲解一下 Python 装饰器","explain"),
     IntentTestCase("为什么列表推导式通常比普通循环更简洁？","qa"),
     IntentTestCase("给我出三道关于 Python 函数的选择题","quiz"),
     IntentTestCase("帮我复习一下今天学过的递归知识","review"),
     IntentTestCase("你好","greeting"),
+    *[
+        IntentTestCase(message, expected_intent)
+        for message, expected_intent in JAVA_INTENT_CASE_DATA
+    ],
 ]
 
 DEFAULT_DIALOG_CASES = [
@@ -953,8 +959,8 @@ DEFAULT_DIALOG_CASES = [
             {
                 "message": "请根据我的薄弱点，换一种更简单的方式讲解",
                 "expected_intent": "review",
-                "expected_agent_type": "explain",
-                "expect_knowledge": False,
+                "expected_agent_type": "general",
+                "expect_knowledge": True,
                 "expected_context_terms": [
                     "[用户画像]",
                     "weak_points",
@@ -987,4 +993,5 @@ DEFAULT_DIALOG_CASES = [
             },
         ],
     },
+    JAVA_20_TURN_DIALOG,
 ]

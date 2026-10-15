@@ -27,6 +27,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
+from core.decision_engine import DecisionEngine
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
 from mcp.tool_manager import MCPToolManager, Tool
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
+    GENERAL = "general"  # 通用Agent
     EXPLAIN   = "explain"    # 讲解Agent
     QA = "qa"  # 答疑Agent
     QUIZ   = "quiz"    # 出题Agent
@@ -101,7 +103,7 @@ class AgentResponse:
     agent_type:  AgentType
     content:     str
     success:     bool
-    confidence:  float = 1.0
+    confidence:  Optional[float] = None
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
     tools_used:  List[str] = field(default_factory=list)
@@ -117,6 +119,11 @@ class Request:
     history:     Optional[List[Dict[str, str]]] = None  # 对话历史，传给意图识别
     intent:      Optional[IntentCategory] = None
     urgency:     Optional[UrgencyLevel]   = None
+    intent_confidence: float = 0.0
+    urgency_confidence: float = 0.0
+    routing_source: str = "unknown"
+    needs_clarification: bool = False
+    needs_rag: bool = True
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
@@ -353,9 +360,14 @@ class BaseAgent:
                 self.stats.success += 1
 
     def _build_system_prompt(self, req: Request) -> str:
-        """Combine the structured role contract with dynamically loaded Skills."""
+        """组合结构化角色契约、澄清约束和动态 Skills。"""
 
         base_prompt = f"{self.system_prompt}\n\n{self.profile.to_prompt_block()}"
+        if req.needs_clarification:
+            base_prompt = (
+                f"{base_prompt}\n\n[决策提示]\n"
+                "当前意图置信度不足。不要猜测用户目标，只提出一个最关键的澄清问题。"
+            )
         if self._skill_manager is None:
             return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
@@ -384,6 +396,43 @@ class BaseAgent:
             "需要人工辅导",
         ]
         return any(keyword in content for keyword in keywords)
+
+
+class GeneralAgent(BaseAgent):
+    agent_type = AgentType.GENERAL
+    system_prompt = (
+        "你是 ProgMind 的通用学习 Agent，负责问候、意图不明确、复习请求和系统降级。"
+        "你不能冒充专用 Agent，也不能声称调用了未授权工具。"
+    )
+    profile = AgentProfile(
+        role="通用学习请求接待者",
+        responsibilities=(
+            "处理问候、复习概述和无法可靠分类的学习请求",
+            "在信息不足时提出一个最关键的澄清问题",
+            "在专用 Agent 失败时提供安全、有限且诚实的通用回应",
+        ),
+        workflow=(
+            "判断当前信息是否足以直接回答",
+            "信息不足时优先澄清目标、课程范围或期望输出",
+            "信息充分时给出简洁回答，并在需要时建议进入专用学习流程",
+        ),
+        input_contract=(
+            "学生当前消息",
+            "最近对话和已提供的学习上下文",
+        ),
+        output_contract=(
+            "不猜测未提供的课程事实",
+            "需要澄清时只提出一个关键问题",
+            "不得宣称使用任何专用工具",
+        ),
+        escalation_conditions=(
+            "请求涉及必须由教师判断的课程规则",
+            "系统无法提供可靠答案或专用能力持续不可用",
+        ),
+        tool_scope=(),
+        temperature=0.2,
+        max_tokens=4096,
+    )
 
 
 class ExplainAgent(BaseAgent):
@@ -515,9 +564,9 @@ class AgentOrchestrator:
         IntentCategory.EXPLAIN:  AgentType.EXPLAIN,
         IntentCategory.QA:    AgentType.QA,
         IntentCategory.QUIZ:    AgentType.QUIZ,
-        IntentCategory.REVIEW: AgentType.EXPLAIN,
-        IntentCategory.GREETING: AgentType.EXPLAIN
-        # 其余意图 → GENERAL（默认）
+        IntentCategory.REVIEW: AgentType.GENERAL,
+        IntentCategory.GREETING: AgentType.GENERAL,
+        IntentCategory.OTHER: AgentType.GENERAL,
     }
 
     def __init__(
@@ -527,6 +576,7 @@ class AgentOrchestrator:
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
         tool_manager: Optional[MCPToolManager] = None,
+        decision_engine: Optional[DecisionEngine] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -534,11 +584,13 @@ class AgentOrchestrator:
         client = AsyncAnthropic(**kwargs)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._decision_engine = decision_engine or DecisionEngine(self._intent_recognizer)
         self._skill_manager = skill_manager
         self._tool_manager = tool_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
+            AgentType.GENERAL: [GeneralAgent(client, model, skill_manager, tool_manager)],
             AgentType.EXPLAIN: [ExplainAgent(client, model, skill_manager, tool_manager)],
             AgentType.QA: [QaAgent(client, model, skill_manager, tool_manager)],
             AgentType.QUIZ: [QuizAgent(client, model, skill_manager, tool_manager)],
@@ -567,19 +619,19 @@ class AgentOrchestrator:
         """
         t0 = time.monotonic()
 
-        # 1. 意图识别（如果调用方已识别则跳过）
-        if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
-            req.intent  = intent_result.intent
-            req.urgency = intent_result.urgency
+        # 1. 生成或复用统一路由决策。
+        await self._ensure_decision(req)
 
-        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
         collaboration = self._collaboration_targets(req)
         if len(collaboration) > 1:
             return await self.run_parallel(req, collaboration)
 
         # 2. 路由：选择 Agent 类型
-        agent_type = self._route(req.intent, req.urgency)
+        agent_type = (
+            AgentType.GENERAL
+            if req.needs_clarification
+            else self._route(req.intent, req.urgency)
+        )
 
         # 3. 执行（含降级）
         response = await self._execute(req, agent_type)
@@ -624,7 +676,14 @@ class AgentOrchestrator:
             for response in successful_responses
         ]
 
-        combined = "\n\n".join(parts) if parts else "抱歉，所有 Agent 均处理失败。"
+        fallback_response: Optional[AgentResponse] = None
+        if not successful_responses:
+            fallback_response = await self._execute(req, AgentType.GENERAL)
+            if fallback_response.success:
+                successful_responses = [fallback_response]
+                parts = [fallback_response.content]
+
+        combined = "\n\n".join(parts) if parts else "学习服务暂时不可用，请稍后重试。"
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
         tools_used = list(dict.fromkeys(
             tool_name
@@ -640,7 +699,11 @@ class AgentOrchestrator:
         return OrchestratorResult(
             request_id=req.request_id,
             response=combined,
-            agent_type=agent_types[0],
+            agent_type=(
+                fallback_response.agent_type
+                if fallback_response is not None and fallback_response.success
+                else agent_types[0]
+            ),
             intent=req.intent,
             #用于判断该编排结果是否成功
             success=bool(successful_responses),
@@ -658,12 +721,7 @@ class AgentOrchestrator:
         一个 delta 返回，避免多个 Agent 的 token 相互穿插破坏可读性。
         """
         t0 = time.monotonic()
-        if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(
-                req.message, history=req.history
-            )
-            req.intent = intent_result.intent
-            req.urgency = intent_result.urgency
+        await self._ensure_decision(req)
 
         collaboration = self._collaboration_targets(req)
         if len(collaboration) > 1:
@@ -677,10 +735,14 @@ class AgentOrchestrator:
             yield {"type": "done", "result": result}
             return
 
-        requested_type = self._route(req.intent, req.urgency)
+        requested_type = (
+            AgentType.GENERAL
+            if req.needs_clarification
+            else self._route(req.intent, req.urgency)
+        )
         agent = self._best_agent(requested_type)
         if agent is None:
-            agent = self._best_agent(AgentType.EXPLAIN)
+            agent = self._best_agent(AgentType.GENERAL)
         if agent is None:
             raise RuntimeError("学习服务暂时不可用，请稍后重试")
 
@@ -696,11 +758,11 @@ class AgentOrchestrator:
                 chunks.append(text)
                 yield {"type": "delta", "text": text}
         except Exception:
-            # 尚未向客户端输出正文时，保留原来的专属 Agent 降级语义。
-            if chunks or requested_type == AgentType.EXPLAIN:
+            # 已输出正文后不能安全切换；通用 Agent 自身失败也不再递归降级。
+            if chunks or requested_type == AgentType.GENERAL:
                 raise
-            logger.warning("%s 流式处理失败，降级到 ExplainAgent", requested_type.value)
-            fallback = self._best_agent(AgentType.EXPLAIN)
+            logger.warning("%s 流式处理失败，降级到 GeneralAgent", requested_type.value)
+            fallback = self._best_agent(AgentType.GENERAL)
             if fallback is None or fallback is agent:
                 raise
             agent = fallback
@@ -729,12 +791,31 @@ class AgentOrchestrator:
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
 
+    async def _ensure_decision(self, req: Request) -> None:
+        """当调用方未提供决策时，统一补齐路由及门控字段。"""
+        if req.intent is not None:
+            return
+
+        decision = await self._decision_engine.decide(
+            req.message,
+            history=req.history,
+            request_id=req.request_id,
+        )
+        req.intent = decision.intent
+        req.urgency = decision.urgency
+        req.intent_confidence = decision.intent_confidence
+        req.urgency_confidence = decision.urgency_confidence
+        req.routing_source = decision.source
+        req.needs_clarification = decision.needs_clarification
+        threshold = float(os.getenv("RAG_DECISION_THRESHOLD", "0.55"))
+        req.needs_rag = decision.should_use_rag(threshold)
+
     def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
         """
         根据学习意图选择 Agent。
         """
         if urgency == UrgencyLevel.CRITICAL:
-            return AgentType.EXPLAIN
+            return AgentType.GENERAL
 
         if intent and intent in self._INTENT_ROUTING:
             target = self._INTENT_ROUTING[intent]
@@ -742,13 +823,16 @@ class AgentOrchestrator:
             if target in self._pool and self._pool[target]:
                 return target
 
-        return AgentType.EXPLAIN
+        return AgentType.GENERAL
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:
         """
         判断是否需要多个 Agent 并行协作。
         意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
         """
+        if req.needs_clarification:
+            return []
+
         msg = req.message.lower()
         targets: List[AgentType] = []
 
@@ -802,23 +886,23 @@ class AgentOrchestrator:
         return max(candidate, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """执行 Agent，失败时降级到 ExplainAgent。"""
+        """执行 Agent，失败时降级到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
-            agent = self._best_agent(AgentType.EXPLAIN)
+            agent = self._best_agent(AgentType.GENERAL)
         if agent is None:
             return AgentResponse(
-                agent_type=AgentType.EXPLAIN,
+                agent_type=AgentType.GENERAL,
                 content="学习服务暂时不可用，请稍后重试",
                 success=False,
             )
 
         response = await agent.handle(req)
 
-        # 专属 Agent 失败时降级到 ExplainAgent
-        if not response.success and agent_type != AgentType.EXPLAIN:
-            logger.warning(f"{agent_type.value} 失败，降级到 ExplainAgent")
-            fallback = self._best_agent(AgentType.EXPLAIN)
+        # 专属 Agent 失败时统一降级到通用 Agent。
+        if not response.success and agent_type != AgentType.GENERAL:
+            logger.warning("%s 失败，降级到 GeneralAgent", agent_type.value)
+            fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
                 response = await fallback.handle(req)
 

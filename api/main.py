@@ -52,6 +52,17 @@ _knowledge_base = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_decision_engine = None
+_jev_client = None
+_evidence_gate = None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """读取布尔环境变量，无法识别时使用默认值。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -70,11 +81,15 @@ def _anthropic_cfg() -> Dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _knowledge_base, _monitor, _evaluator, _skill_manager
+    global _decision_engine, _jev_client, _evidence_gate
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
+    from core.decision_engine import DecisionEngine
+    from core.evidence_gate import JevEvidenceShadowGate
     from core.intent_recognizer import IntentRecognizer
+    from core.jev_client import JevClient
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager
@@ -91,6 +106,25 @@ async def lifespan(app: FastAPI):
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+    )
+
+    # Jev 默认只运行影子决策；未配置密钥时不会创建网络连接。
+    _jev_client = JevClient(
+        api_key=os.getenv("TYPESAFE_API_KEY", ""),
+        model=os.getenv("JEV_MODEL", "jev-latest"),
+        base_url=os.getenv("JEV_BASE_URL", "https://api.typesafe.ai"),
+        timeout_s=float(os.getenv("JEV_TIMEOUT_S", "3")),
+    )
+    _decision_engine = DecisionEngine(
+        recognizer,
+        _jev_client,
+        shadow_enabled=_env_flag("JEV_SHADOW_ENABLED"),
+        confidence_threshold=float(os.getenv("INTENT_MIN_CONFIDENCE", "0.55")),
+    )
+    _evidence_gate = JevEvidenceShadowGate(
+        _jev_client,
+        enabled=_env_flag("RAG_EVIDENCE_SHADOW_ENABLED"),
+        max_concurrency=int(os.getenv("RAG_EVIDENCE_SHADOW_CONCURRENCY", "4")),
     )
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
@@ -139,6 +173,7 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
         skill_manager=_skill_manager,
         tool_manager=_tool_manager,
+        decision_engine=_decision_engine,
     )
 
     # 性能监控（可选启动 Prometheus）
@@ -167,6 +202,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
+    await _jev_client.aclose()
     logger.info("EchoMind 已关闭")
 
 #评测调用
@@ -442,20 +478,38 @@ async def chat_stream(req: ChatRequest):
 
 
 async def _prepare_chat_request(req: ChatRequest, conv_id: str):
-    """并行读取 Memory/RAG，并构建普通和流式接口共用的编排请求。"""
+    """并行读取 Memory 和路由决策，再按决策条件检索 RAG。"""
     from agents.agent_orchestrator import Request as OrcReq
 
+    request_id = str(uuid.uuid4())[:8]
     memory_task = asyncio.create_task(
         _memory.get_context(req.user_id, conv_id, query=req.message)
     )
-    knowledge_task = asyncio.create_task(_build_knowledge_context(req.message))
-    mem_ctx, knowledge_result = await asyncio.gather(memory_task, knowledge_task)
-    knowledge_text, knowledge_used = knowledge_result
+    decision_task = (
+        asyncio.create_task(
+            _decision_engine.decide(req.message, request_id=request_id)
+        )
+        if _decision_engine is not None
+        else None
+    )
+
+    mem_ctx = await memory_task
+    decision = await decision_task if decision_task is not None else None
 
     history = [
         {"role": message.role.value, "content": message.content}
         for message in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
+
+    rag_threshold = float(os.getenv("RAG_DECISION_THRESHOLD", "0.55"))
+    needs_rag = decision.should_use_rag(rag_threshold) if decision else True
+    knowledge_text = ""
+    knowledge_used = False
+    if needs_rag:
+        knowledge_text, knowledge_used = await _build_knowledge_context(
+            req.message,
+            request_id=request_id,
+        )
 
     context_parts = [mem_ctx.to_prompt_text()]
     if knowledge_text:
@@ -467,6 +521,14 @@ async def _prepare_chat_request(req: ChatRequest, conv_id: str):
         conv_id=conv_id,
         context="\n\n".join(part for part in context_parts if part),
         history=history,
+        intent=decision.intent if decision else None,
+        urgency=decision.urgency if decision else None,
+        intent_confidence=decision.intent_confidence if decision else 0.0,
+        urgency_confidence=decision.urgency_confidence if decision else 0.0,
+        routing_source=decision.source if decision else "unknown",
+        needs_clarification=decision.needs_clarification if decision else False,
+        needs_rag=needs_rag,
+        request_id=request_id,
     ), knowledge_used
 
 
@@ -481,8 +543,9 @@ async def _search_course_knowledge(
     top_k: int,
     *,
     enhanced: bool = False,
+    request_id: str = "",
 ) -> List[Dict[str, Any]]:
-    """Normal chat RAG service; it is deliberately not exposed as an Agent tool."""
+    """普通聊天 RAG 服务；它不会作为 Agent 工具暴露。"""
     if _knowledge_base is None:
         return []
 
@@ -521,14 +584,30 @@ async def _search_course_knowledge(
             if previous is None or float(item.get("score", 0.0)) > float(previous.get("score", 0.0)):
                 merged[key] = item
 
-    return sorted(
+    ranked = sorted(
         merged.values(),
         key=lambda item: float(item.get("fusion_score", item.get("score", 0.0))),
         reverse=True,
-    )[:top_k]
+    )
+
+    # 阶段五只记录影子准入结果，不改变正式检索片段及其顺序。
+    if _evidence_gate is not None and _evidence_gate.enabled:
+        shadow_top_k = max(1, int(os.getenv("RAG_EVIDENCE_SHADOW_TOP_K", "6")))
+        await _evidence_gate.evaluate_all(
+            query,
+            ranked[:shadow_top_k],
+            request_id=request_id,
+        )
+
+    return ranked[:top_k]
 
 
-async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, bool]:
+async def _build_knowledge_context(
+    message: str,
+    top_k: int = 3,
+    *,
+    request_id: str = "",
+) -> tuple[str, bool]:
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
@@ -542,9 +621,13 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         # 对话链路默认使用单次向量检索，避免查询改写和重排额外产生两次 LLM
         # 请求。需要更高召回率时可设置 CHAT_RAG_MODE=enhanced 恢复完整链路。
         if os.getenv("CHAT_RAG_MODE", "fast").strip().lower() == "enhanced":
-            items = await _search_course_knowledge(message, top_k, enhanced=True)
+            items = await _search_course_knowledge(
+                message, top_k, enhanced=True, request_id=request_id
+            )
         else:
-            items = await _search_course_knowledge(message, top_k)
+            items = await _search_course_knowledge(
+                message, top_k, request_id=request_id
+            )
 
         # 快速检索没有命中时，才执行查询改写，提高召回率。
         fallback_enabled = (os.getenv("CHAT_RAG_FALLBACK_ENHANCED","true",)
@@ -559,7 +642,9 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
                 "RAG 快速检索无结果，启用增强检索: query=%r",
                 message,
             )
-            items = await _search_course_knowledge(message, top_k, enhanced=True)
+            items = await _search_course_knowledge(
+                message, top_k, enhanced=True, request_id=request_id
+            )
 
         parts = ["[知识库检索结果]"]
         seen = set()

@@ -1,6 +1,13 @@
 import unittest
 
-from agents.agent_orchestrator import AgentProfile, ExplainAgent, QaAgent, QuizAgent, Request
+from agents.agent_orchestrator import (
+    AgentProfile,
+    ExplainAgent,
+    GeneralAgent,
+    QaAgent,
+    QuizAgent,
+    Request,
+)
 from mcp.tool_manager import MCPToolManager, Tool
 from tools.contracts import object_schema
 
@@ -17,6 +24,7 @@ def make_manager():
     manager = MCPToolManager("test-key")
     for name in {
         *ExplainAgent.profile.tool_scope,
+        *GeneralAgent.profile.tool_scope,
         *QaAgent.profile.tool_scope,
         *QuizAgent.profile.tool_scope,
     }:
@@ -40,14 +48,18 @@ class AgentProfileTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = make_manager()
         self.explain = ExplainAgent(self.client, "test-model", tool_manager=self.manager)
+        self.general = GeneralAgent(self.client, "test-model", tool_manager=self.manager)
         self.qa = QaAgent(self.client, "test-model", tool_manager=self.manager)
         self.quiz = QuizAgent(self.client, "test-model", tool_manager=self.manager)
 
     def test_agents_have_distinct_structured_role_contracts(self):
-        profiles = [agent.profile for agent in (self.explain, self.qa, self.quiz)]
+        profiles = [
+            agent.profile
+            for agent in (self.general, self.explain, self.qa, self.quiz)
+        ]
         self.assertTrue(all(isinstance(profile, AgentProfile) for profile in profiles))
-        self.assertEqual(3, len({profile.role for profile in profiles}))
-        self.assertEqual(3, len({profile.workflow for profile in profiles}))
+        self.assertEqual(4, len({profile.role for profile in profiles}))
+        self.assertEqual(4, len({profile.workflow for profile in profiles}))
         self.assertTrue(all(profile.responsibilities for profile in profiles))
         self.assertTrue(all(profile.input_contract for profile in profiles))
         self.assertTrue(all(profile.output_contract for profile in profiles))
@@ -71,11 +83,12 @@ class AgentProfileTests(unittest.TestCase):
         self.assertNotIn("search_course_material", prompt)
 
     def test_manager_tools_are_filtered_by_each_profile_scope(self):
-        for agent in (self.explain, self.qa, self.quiz):
+        for agent in (self.general, self.explain, self.qa, self.quiz):
             self.assertEqual(set(agent.profile.tool_scope), set(agent.get_tools()))
             self.assertNotIn("undeclared_admin_tool", agent.get_tools())
 
         self.assertIn("check_prerequisites", self.explain.get_tools())
+        self.assertEqual({}, self.general.get_tools())
         self.assertNotIn("grade_answer", self.explain.get_tools())
         self.assertIn("build_hint_plan", self.qa.get_tools())
         self.assertEqual({"check_prerequisites"}, set(self.explain.get_tools()))
