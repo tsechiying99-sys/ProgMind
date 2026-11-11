@@ -26,3 +26,8 @@ python-dotenv==1.0.1
 sentence-transformers==3.3.1
 rank-bm25==0.2.2
 jieba==0.42.1
+
+# ── PDF 解析 / OCR ───────────────────────────────────────────────────────────
+PyMuPDF==2.0               # 原生 PDF 文本提取与扫描页渲染
+rapidocr==3.10.0           # 扫描 PDF 的中文 OCR
+onnxruntime==1.29.0        # RapidOCR 的 CPU 推理后端

@@ -13,7 +13,7 @@ def register_learning_tools(manager: MCPToolManager, deps: ToolDependencies) -> 
         check_prerequisites.create_tool(),
         build_hint_plan.create_tool(),
         # 题目检索工具
-        search_question_bank.create_tool(deps.knowledge_base),
+        search_question_bank.create_tool(deps.knowledge_base, manager),
         # 评分与学习结果写入工具
         grade_answer.create_tool(),
         record_learning_result.create_tool(deps.memory_manager),

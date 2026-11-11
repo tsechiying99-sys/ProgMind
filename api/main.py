@@ -28,6 +28,12 @@ from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel,Field
 
+from ingestion import (
+    DocumentIngestionPipeline,
+    DocumentQualityError,
+    PDFValidationError,
+)
+
 load_dotenv()
 
 #初始化项目日志系统，并创建当前模块的 logger，让 ProgMind 在运行时能够按照统一格式输出运行信息。
@@ -53,16 +59,8 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _decision_engine = None
-_jev_client = None
-_evidence_gate = None
+_ingestion_pipeline = None
 
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    """读取布尔环境变量，无法识别时使用默认值。"""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -81,15 +79,13 @@ def _anthropic_cfg() -> Dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _knowledge_base, _monitor, _evaluator, _skill_manager
-    global _decision_engine, _jev_client, _evidence_gate
+    global _decision_engine, _ingestion_pipeline
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from core.decision_engine import DecisionEngine
-    from core.evidence_gate import JevEvidenceShadowGate
     from core.intent_recognizer import IntentRecognizer
-    from core.jev_client import JevClient
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager
@@ -108,23 +104,9 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # Jev 默认只运行影子决策；未配置密钥时不会创建网络连接。
-    _jev_client = JevClient(
-        api_key=os.getenv("TYPESAFE_API_KEY", ""),
-        model=os.getenv("JEV_MODEL", "jev-latest"),
-        base_url=os.getenv("JEV_BASE_URL", "https://api.typesafe.ai"),
-        timeout_s=float(os.getenv("JEV_TIMEOUT_S", "3")),
-    )
     _decision_engine = DecisionEngine(
         recognizer,
-        _jev_client,
-        shadow_enabled=_env_flag("JEV_SHADOW_ENABLED"),
         confidence_threshold=float(os.getenv("INTENT_MIN_CONFIDENCE", "0.55")),
-    )
-    _evidence_gate = JevEvidenceShadowGate(
-        _jev_client,
-        enabled=_env_flag("RAG_EVIDENCE_SHADOW_ENABLED"),
-        max_concurrency=int(os.getenv("RAG_EVIDENCE_SHADOW_CONCURRENCY", "4")),
     )
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
@@ -157,6 +139,7 @@ async def lifespan(app: FastAPI):
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
     )
+    _ingestion_pipeline = DocumentIngestionPipeline.from_environment()
     logger.info(f"知识库已加载: {_knowledge_base.doc_count} 个文档片段")
     register_learning_tools(
         _tool_manager,
@@ -202,7 +185,6 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
-    await _jev_client.aclose()
     logger.info("EchoMind 已关闭")
 
 #评测调用
@@ -478,28 +460,26 @@ async def chat_stream(req: ChatRequest):
 
 
 async def _prepare_chat_request(req: ChatRequest, conv_id: str):
-    """并行读取 Memory 和路由决策，再按决策条件检索 RAG。"""
+    """读取 Memory 后结合最近对话完成路由决策，再按条件检索 RAG。"""
     from agents.agent_orchestrator import Request as OrcReq
 
     request_id = str(uuid.uuid4())[:8]
-    memory_task = asyncio.create_task(
-        _memory.get_context(req.user_id, conv_id, query=req.message)
-    )
-    decision_task = (
-        asyncio.create_task(
-            _decision_engine.decide(req.message, request_id=request_id)
-        )
-        if _decision_engine is not None
-        else None
-    )
-
-    mem_ctx = await memory_task
-    decision = await decision_task if decision_task is not None else None
+    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
     history = [
         {"role": message.role.value, "content": message.content}
         for message in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
+
+    decision = (
+        await _decision_engine.decide(
+            req.message,
+            history=history,
+            request_id=request_id,
+        )
+        if _decision_engine is not None
+        else None
+    )
 
     rag_threshold = float(os.getenv("RAG_DECISION_THRESHOLD", "0.55"))
     needs_rag = decision.should_use_rag(rag_threshold) if decision else True
@@ -528,6 +508,7 @@ async def _prepare_chat_request(req: ChatRequest, conv_id: str):
         routing_source=decision.source if decision else "unknown",
         needs_clarification=decision.needs_clarification if decision else False,
         needs_rag=needs_rag,
+        collaboration_plan=decision.collaboration if decision else None,
         request_id=request_id,
     ), knowledge_used
 
@@ -545,7 +526,7 @@ async def _search_course_knowledge(
     enhanced: bool = False,
     request_id: str = "",
 ) -> List[Dict[str, Any]]:
-    """普通聊天 RAG 服务；它不会作为 Agent 工具暴露。"""
+    """执行召回、RRF 融合后的统一 LLM 重排；不作为 Agent 工具暴露。"""
     if _knowledge_base is None:
         return []
 
@@ -554,7 +535,16 @@ async def _search_course_knowledge(
         rewritten = await _tool_manager.rewrite_query(query, n=3)
         queries = list(dict.fromkeys([query, *rewritten]))
 
-    recall_k = max(top_k, 5)
+    rerank_enabled = (
+        os.getenv("RAG_LLM_RERANK_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    rerank_candidates = max(
+        top_k,
+        int(os.getenv("RAG_RERANK_MAX_CANDIDATES", "10")),
+    )
+    # 先保留足够的 RRF 候选，再由 LLM 选出最终 Top-K。
+    recall_k = rerank_candidates if rerank_enabled else max(top_k, 5)
     tasks = [
         _knowledge_base.search_handler(
             {
@@ -590,15 +580,8 @@ async def _search_course_knowledge(
         reverse=True,
     )
 
-    # 阶段五只记录影子准入结果，不改变正式检索片段及其顺序。
-    if _evidence_gate is not None and _evidence_gate.enabled:
-        shadow_top_k = max(1, int(os.getenv("RAG_EVIDENCE_SHADOW_TOP_K", "6")))
-        await _evidence_gate.evaluate_all(
-            query,
-            ranked[:shadow_top_k],
-            request_id=request_id,
-        )
-
+    if rerank_enabled and _tool_manager is not None and ranked:
+        return await _tool_manager.rerank_results(query, ranked, top_k)
     return ranked[:top_k]
 
 
@@ -618,8 +601,8 @@ async def _build_knowledge_context(
     if not _should_use_knowledge(message):
         return "", False
     try:
-        # 对话链路默认使用单次向量检索，避免查询改写和重排额外产生两次 LLM
-        # 请求。需要更高召回率时可设置 CHAT_RAG_MODE=enhanced 恢复完整链路。
+        # fast 模式只省略查询改写；Dense+BM25 的 RRF 融合结果仍会统一经过 LLM 重排。
+        # 需要更高召回率时可设置 CHAT_RAG_MODE=enhanced 启用多查询召回。
         if os.getenv("CHAT_RAG_MODE", "fast").strip().lower() == "enhanced":
             items = await _search_course_knowledge(
                 message, top_k, enhanced=True, request_id=request_id
@@ -657,7 +640,7 @@ async def _build_knowledge_context(
                 continue
             title = str(item.get("title", "未命名文档"))
             content = str(item.get("content", "")).strip()
-            score = item.get("score", "")
+            score = item.get("rerank_score", item.get("score", ""))
 
             dedupe_key = (title, content)
             if not content or dedupe_key in seen:
@@ -718,7 +701,11 @@ async def search(query: str, top_k: int = 5):
         raise HTTPException(503, "服务未就绪")
     top_k = max(1, min(top_k, 8))
     results = await _search_course_knowledge(query, top_k, enhanced=True)
-    return {"query": query, "results": results, "reranked": True}
+    return {
+        "query": query,
+        "results": results,
+        "reranked": any(item.get("rerank_applied") is True for item in results),
+    }
 
 
 class DocInput(BaseModel):
@@ -814,20 +801,56 @@ async def upload_knowledge(file: UploadFile = File(...)):
     支持格式：
     - `.txt` / `.md`：整个文件作为一篇文档，文件名作为标题
     - `.json`：JSON 数组格式 `[{"title": "...", "content": "..."}, ...]`
+    - `.pdf`：逐页检测原生文本，扫描页自动使用 RapidOCR
 
-    文件大小限制：10MB
+    文件大小限制由 `KNOWLEDGE_MAX_UPLOAD_MB` 配置，默认 30MB。
     """
     if _knowledge_base is None or _tool_manager is None:
         raise HTTPException(503, "知识库未初始化")
 
-    content = await file.read()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(413, "文件大小超过 10MB 限制")
+    filename = file.filename or "unknown"
+    suffix = pathlib.Path(filename).suffix.lower()
+    if suffix not in {".txt", ".md", ".json", ".pdf"}:
+        raise HTTPException(415, "仅支持 TXT、Markdown、JSON 和 PDF 文件")
+
+    max_upload_mb = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_MB", "30"))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+    content = await file.read(max_upload_bytes + 1)
+    if len(content) > max_upload_bytes:
+        raise HTTPException(413, f"文件大小超过 {max_upload_mb}MB 限制")
+    if not content:
+        raise HTTPException(400, "上传文件为空")
+
+    if suffix == ".pdf":
+        if _ingestion_pipeline is None:
+            raise HTTPException(503, "PDF 解析流水线未初始化")
+        try:
+            result = await asyncio.to_thread(
+                _ingestion_pipeline.ingest_pdf,
+                content,
+                filename,
+            )
+            count = await asyncio.to_thread(
+                _knowledge_base.add_chunks,
+                [chunk.to_record() for chunk in result.chunks],
+            )
+        except PDFValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except DocumentQualityError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        _tool_manager.clear_cache("search_question_bank")
+        return {
+            "message": f"PDF {filename} 解析并导入成功",
+            "document_id": result.document_id,
+            "added_chunks": count,
+            "total_chunks": _knowledge_base.doc_count,
+            **result.report.to_dict(),
+        }
 
     text = content.decode("utf-8", errors="ignore")
-    filename = file.filename or "unknown"
 
-    if filename.endswith(".json"):
+    if suffix == ".json":
         import json as _json
         try:
             docs = _json.loads(text)

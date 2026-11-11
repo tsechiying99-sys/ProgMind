@@ -65,7 +65,10 @@ async function submitFile(): Promise<void> {
     const result = await uploadKnowledge(selectedFile.value);
     totalChunks.value = result.total_chunks;
     selectedFile.value = null;
-    ElMessage.success(result.message);
+    const quality = result.quality_score == null
+      ? ""
+      : `，解析质量 ${(result.quality_score * 100).toFixed(1)}%`;
+    ElMessage.success(`${result.message}${quality}`);
   } catch (error) {
     ElMessage.error(getApiErrorMessage(error));
   } finally {
@@ -123,13 +126,13 @@ onMounted(refreshStats);
       <article class="panel upload-panel">
         <div class="panel-heading">
           <div><span>02</span><h2>文件上传</h2></div>
-          <small>最大 10 MB</small>
+          <small>最大 30 MB</small>
         </div>
         <div class="drop-zone">
           <div class="file-icon">↑</div>
           <strong>{{ selectedFile?.name || "选择课程文件" }}</strong>
-          <p>支持 TXT、Markdown 和 JSON 文档</p>
-          <input type="file" accept=".txt,.md,.json" @change="selectFile" />
+          <p>支持 TXT、Markdown、JSON 和 PDF 文档；扫描 PDF 自动 OCR</p>
+          <input type="file" accept=".txt,.md,.json,.pdf,application/pdf" @change="selectFile" />
         </div>
         <button class="primary-button" type="button" :disabled="uploading || !selectedFile" @click="submitFile">
           {{ uploading ? "正在上传…" : "上传并解析" }}

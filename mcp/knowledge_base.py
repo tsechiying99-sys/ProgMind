@@ -1,5 +1,5 @@
 """
-RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
+RAG 知识库 —— 基于BGE与BM25的混合检索。
 
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB
@@ -232,7 +232,7 @@ class KnowledgeBase:
         documents 格式: [{"title": "...", "content": "..."}, ...]
         长文档会自动切片（每片 500 字）。
         """
-        ids, docs, metas = [], [], []
+        records = []
 
         for doc in documents:
             title   = doc.get("title", "")
@@ -243,15 +243,57 @@ class KnowledgeBase:
                 doc_id = hashlib.md5(
                     f"{title}_{i}_{chunk}".encode("utf-8")
                 ).hexdigest()
-                ids.append(doc_id)
-                docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                records.append({
+                    "id": doc_id,
+                    "content": chunk,
+                    "metadata": {
+                        "title": title,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                    },
+                })
+
+        return self.add_chunks(records)
+
+    def add_chunks(self, chunks: List[Dict[str, Any]]) -> int:
+        """
+        写入已完成切片的知识片段。
+
+        PDF 摄取流水线会保留页码、解析策略、OCR 置信度等元数据，
+        因此不能再次调用 ``add_documents`` 进行二次切片。
+        """
+        ids: List[str] = []
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        scalar_types = (str, int, float, bool)
+
+        for chunk in chunks:
+            chunk_id = str(chunk.get("id", "")).strip()
+            content = str(chunk.get("content", "")).strip()
+            if not chunk_id or not content:
+                continue
+
+            raw_metadata = chunk.get("metadata") or {}
+            metadata = {
+                str(key): value
+                for key, value in raw_metadata.items()
+                if isinstance(value, scalar_types)
+            }
+            ids.append(chunk_id)
+            documents.append(content)
+            metadatas.append(metadata)
 
         if ids:
-            embeddings = self._encoder.encode_documents(docs)
-            self._collection.upsert(ids=ids, documents=docs, metadatas=metas ,embeddings=embeddings)
+            # 先完成全部向量计算，再统一 upsert，避免中途失败留下半份文档。
+            embeddings = self._encoder.encode_documents(documents)
+            self._collection.upsert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
             self._rebuild_bm25_index()
-            logger.info("知识库导入 %d 个文档片段，BM25 索引已刷新",len(ids),)
+            logger.info("知识库导入 %d 个文档片段，BM25 索引已刷新", len(ids))
 
         return len(ids)
 

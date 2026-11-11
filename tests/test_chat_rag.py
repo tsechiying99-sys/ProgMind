@@ -1,38 +1,40 @@
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from api import main
+from core.decision_models import CollaborationPlan
 
 
 class FakeKnowledgeBase:
-    def __init__(self):
+    def __init__(self, results=None):
         self.calls = []
-
-    async def search_handler(self, params, context):
-        self.calls.append(params)
-        return [{
+        self.results = results or [{
             "title": "函数参数",
             "content": "形参在定义中，实参在调用中。",
             "score": 0.9,
+            "fusion_score": 0.9,
             "chunk": 0,
         }]
 
+    async def search_handler(self, params, context):
+        self.calls.append(params)
+        return list(self.results)
+
 
 class FakeToolManager:
+    def __init__(self):
+        self.rerank_calls = []
+
     async def rewrite_query(self, query, n=3):
         return [query, "Python 形参与实参"]
 
-
-class FakeEvidenceGate:
-    enabled = True
-
-    def __init__(self):
-        self.calls = []
-
-    async def evaluate_all(self, query, passages, *, request_id=""):
-        self.calls.append((query, list(passages), request_id))
-        return []
+    async def rerank_results(self, query, items, top_k):
+        self.rerank_calls.append((query, list(items), top_k))
+        return [
+            {**item, "rerank_applied": True, "rerank_score": 0.95}
+            for item in items[:top_k]
+        ]
 
 
 class FakeMemoryContext:
@@ -54,13 +56,14 @@ class FakeNoRagDecision:
     urgency_confidence = 0.0
     source = "test"
     needs_clarification = True
+    collaboration = CollaborationPlan()
 
     def should_use_rag(self, threshold):
         return False
 
 
 class FakeDecisionEngine:
-    async def decide(self, message, request_id=""):
+    async def decide(self, message, history=None, request_id=""):
         return FakeNoRagDecision()
 
 
@@ -76,9 +79,10 @@ class ChatRagTests(unittest.TestCase):
 
     def test_enhanced_rag_rewrites_and_deduplicates_results(self):
         knowledge_base = FakeKnowledgeBase()
+        tool_manager = FakeToolManager()
         with (
             patch.object(main, "_knowledge_base", knowledge_base),
-            patch.object(main, "_tool_manager", FakeToolManager()),
+            patch.object(main, "_tool_manager", tool_manager),
         ):
             results = asyncio.run(main._search_course_knowledge(
                 "函数参数", 3, enhanced=True
@@ -86,21 +90,43 @@ class ChatRagTests(unittest.TestCase):
 
         self.assertEqual(2, len(knowledge_base.calls))
         self.assertEqual(1, len(results))
+        self.assertEqual(1, len(tool_manager.rerank_calls))
 
-    def test_evidence_shadow_does_not_filter_production_results(self):
-        knowledge_base = FakeKnowledgeBase()
-        evidence_gate = FakeEvidenceGate()
+    def test_llm_rerank_receives_rrf_sorted_candidates(self):
+        knowledge_base = FakeKnowledgeBase(results=[
+            {
+                "title": "低相关片段", "content": "低相关内容",
+                "score": 0.2, "fusion_score": 0.2, "chunk": 0,
+            },
+            {
+                "title": "高相关片段", "content": "高相关内容",
+                "score": 0.9, "fusion_score": 0.9, "chunk": 1,
+            },
+        ])
+        tool_manager = FakeToolManager()
         with (
             patch.object(main, "_knowledge_base", knowledge_base),
-            patch.object(main, "_evidence_gate", evidence_gate),
+            patch.object(main, "_tool_manager", tool_manager),
         ):
-            results = asyncio.run(main._search_course_knowledge(
-                "函数参数", 3, request_id="r1"
-            ))
+            asyncio.run(main._search_course_knowledge("函数参数", 1))
 
-        self.assertEqual(1, len(results))
-        self.assertEqual("形参在定义中，实参在调用中。", results[0]["content"])
-        self.assertEqual("r1", evidence_gate.calls[0][2])
+        candidates = tool_manager.rerank_calls[0][1]
+        self.assertEqual([0.9, 0.2], [item["fusion_score"] for item in candidates])
+
+    def test_search_reports_actual_rerank_state(self):
+        with (
+            patch.object(main, "_tool_manager", object()),
+            patch.object(
+                main,
+                "_search_course_knowledge",
+                AsyncMock(return_value=[{
+                    "content": "答案", "score": 0.96, "rerank_applied": True,
+                }]),
+            ),
+        ):
+            response = asyncio.run(main.search("函数参数", 3))
+
+        self.assertTrue(response["reranked"])
 
     def test_clarification_decision_skips_rag(self):
         knowledge_base = FakeKnowledgeBase()

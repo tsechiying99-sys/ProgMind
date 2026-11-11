@@ -8,9 +8,9 @@
   2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
   3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAgent
 
-并行协作：
-  - 复杂问题（如"技术问题 + 账单问题"）可同时派发给多个 Agent
-  - 结果由 Orchestrator 合并后返回
+语义协作：
+  - 结构化规划器根据完整语义和对话历史决定单 Agent、并行或串行
+  - 多 Agent 结果经过统一整合、去重和冲突处理后返回
 
 升级机制：
   - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
@@ -21,13 +21,14 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
 from core.decision_engine import DecisionEngine
+from core.decision_models import AgentTask, CollaborationMode, CollaborationPlan
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
 from mcp.tool_manager import MCPToolManager, Tool
@@ -124,6 +125,7 @@ class Request:
     routing_source: str = "unknown"
     needs_clarification: bool = False
     needs_rag: bool = True
+    collaboration_plan: Optional[CollaborationPlan] = None
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
@@ -554,9 +556,10 @@ class AgentOrchestrator:
     多 Agent 编排器。
 
     路由逻辑（三层）：
-      1. 意图 → Agent 类型映射
-      2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+      1. 语义规划 → 单 Agent、并行或串行协作
+      2. 意图 → Agent 类型映射
+      3. 同类多实例时按 routing_score() 选最优
+      4. 专属 Agent 失败时降级到 GeneralAgent
     """
 
     # 意图 → Agent 类型的静态映射（路由表）
@@ -582,6 +585,8 @@ class AgentOrchestrator:
         if base_url:
             kwargs["base_url"] = base_url
         client = AsyncAnthropic(**kwargs)
+        self._client = client
+        self._model = model
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._decision_engine = decision_engine or DecisionEngine(self._intent_recognizer)
@@ -622,9 +627,10 @@ class AgentOrchestrator:
         # 1. 生成或复用统一路由决策。
         await self._ensure_decision(req)
 
-        collaboration = self._collaboration_targets(req)
+        collaboration = self._collaboration_tasks(req)
         if len(collaboration) > 1:
-            return await self.run_parallel(req, collaboration)
+            mode = req.collaboration_plan.mode if req.collaboration_plan else CollaborationMode.PARALLEL
+            return await self.run_collaboration(req, collaboration, mode)
 
         # 2. 路由：选择 Agent 类型
         agent_type = (
@@ -655,36 +661,73 @@ class AgentOrchestrator:
             tool_traces=list(response.tool_traces),
         )
 
-    async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
-        """
-        并行派发给多个 Agent，合并结果。
-        适用于复杂问题（如同时涉及技术和账单）。
-        """
+    async def run_collaboration(
+        self,
+        req: Request,
+        tasks: List[Tuple[AgentType, AgentTask]],
+        mode: CollaborationMode,
+    ) -> OrchestratorResult:
+        """按结构化计划执行多个 Agent，并由模型统一整合结果。"""
         t0 = time.monotonic()
-        tasks = [self._execute(req, at) for at in agent_types]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        responses: List[Any] = []
+        if mode == CollaborationMode.SEQUENTIAL:
+            previous_outputs: List[str] = []
+            for agent_type, task in tasks:
+                context = req.context
+                if previous_outputs:
+                    context = (
+                        f"{context}\n\n[前置子任务结果]\n"
+                        + "\n\n".join(previous_outputs)
+                    ).strip()
+                sub_request = replace(
+                    req,
+                    message=task.instruction,
+                    context=context,
+                    collaboration_plan=None,
+                )
+                response = await self._execute(sub_request, agent_type)
+                responses.append(response)
+                if response.success:
+                    previous_outputs.append(response.content)
+        else:
+            pending = [
+                self._execute(
+                    replace(
+                        req,
+                        message=task.instruction,
+                        collaboration_plan=None,
+                    ),
+                    agent_type,
+                )
+                for agent_type, task in tasks
+            ]
+            responses = list(await asyncio.gather(*pending, return_exceptions=True))
 
-        # 合并：拼接所有成功响应
-        successful_responses = [
-            response
-            for response in responses
+        successful_pairs = [
+            (planned_task, response)
+            for planned_task, response in zip(tasks, responses)
             if isinstance(response, AgentResponse) and response.success
         ]
-
-        parts = [
-            f"[{response.agent_type.value}]\n{response.content}"
-            for response in successful_responses
-        ]
+        successful_responses = [response for _, response in successful_pairs]
 
         fallback_response: Optional[AgentResponse] = None
         if not successful_responses:
             fallback_response = await self._execute(req, AgentType.GENERAL)
             if fallback_response.success:
                 successful_responses = [fallback_response]
-                parts = [fallback_response.content]
 
-        combined = "\n\n".join(parts) if parts else "学习服务暂时不可用，请稍后重试。"
-        escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        if len(successful_responses) > 1:
+            combined = await self._synthesize_collaboration(
+                req,
+                successful_pairs,
+            )
+        elif successful_responses:
+            combined = successful_responses[0].content
+        else:
+            combined = "学习服务暂时不可用，请稍后重试。"
+        escalated = any(
+            isinstance(r, AgentResponse) and r.escalate for r in responses
+        ) or bool(fallback_response and fallback_response.escalate)
         tools_used = list(dict.fromkeys(
             tool_name
             for response in successful_responses
@@ -702,7 +745,11 @@ class AgentOrchestrator:
             agent_type=(
                 fallback_response.agent_type
                 if fallback_response is not None and fallback_response.success
-                else agent_types[0]
+                else (
+                    successful_responses[0].agent_type
+                    if successful_responses
+                    else tasks[0][0]
+                )
             ),
             intent=req.intent,
             #用于判断该编排结果是否成功
@@ -717,20 +764,21 @@ class AgentOrchestrator:
         """
         流式执行一次请求。
 
-        单 Agent 直接转发模型 token；复合意图继续使用原并行编排，完成后作为
-        一个 delta 返回，避免多个 Agent 的 token 相互穿插破坏可读性。
+        单 Agent 直接转发模型 token；多 Agent 协作完成并整合后作为一个 delta
+        返回，避免多个 Agent 的 token 相互穿插破坏可读性。
         """
         t0 = time.monotonic()
         await self._ensure_decision(req)
 
-        collaboration = self._collaboration_targets(req)
+        collaboration = self._collaboration_tasks(req)
         if len(collaboration) > 1:
             yield {
                 "type": "meta",
                 "intent": req.intent.value if req.intent else "other",
-                "agent_type": collaboration[0].value,
+                "agent_type": collaboration[0][0].value,
             }
-            result = await self.run_parallel(req, collaboration)
+            mode = req.collaboration_plan.mode if req.collaboration_plan else CollaborationMode.PARALLEL
+            result = await self.run_collaboration(req, collaboration, mode)
             yield {"type": "delta", "text": result.response}
             yield {"type": "done", "result": result}
             return
@@ -807,6 +855,7 @@ class AgentOrchestrator:
         req.urgency_confidence = decision.urgency_confidence
         req.routing_source = decision.source
         req.needs_clarification = decision.needs_clarification
+        req.collaboration_plan = decision.collaboration
         threshold = float(os.getenv("RAG_DECISION_THRESHOLD", "0.55"))
         req.needs_rag = decision.should_use_rag(threshold)
 
@@ -825,45 +874,85 @@ class AgentOrchestrator:
 
         return AgentType.GENERAL
 
-    def _collaboration_targets(self, req: Request) -> List[AgentType]:
-        """
-        判断是否需要多个 Agent 并行协作。
-        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        """
-        if req.needs_clarification:
+    def _collaboration_tasks(self, req: Request) -> List[Tuple[AgentType, AgentTask]]:
+        """校验语义规划器给出的多 Agent 任务，不再扫描关键词。"""
+        plan = req.collaboration_plan
+        if req.needs_clarification or plan is None or plan.mode == CollaborationMode.SINGLE:
             return []
 
-        msg = req.message.lower()
-        targets: List[AgentType] = []
+        threshold = float(os.getenv("COLLABORATION_MIN_CONFIDENCE", "0.70"))
+        if plan.confidence < threshold:
+            return []
 
-        explain_keywords = [
-            "解释", "讲一下", "什么是", "原理", "概念",
+        result: List[Tuple[AgentType, AgentTask]] = []
+        seen = set()
+        for task in plan.tasks[:2]:
+            try:
+                agent_type = AgentType(task.agent_type)
+            except ValueError:
+                continue
+            if (
+                agent_type == AgentType.GENERAL
+                or agent_type in seen
+                or not self._pool.get(agent_type)
+            ):
+                continue
+            result.append((agent_type, task))
+            seen.add(agent_type)
+        return result if len(result) > 1 else []
+
+    async def _synthesize_collaboration(
+        self,
+        req: Request,
+        results: List[Tuple[Tuple[AgentType, AgentTask], AgentResponse]],
+    ) -> str:
+        """将多个角色的结果去重、消解冲突并整理为一个最终回答。"""
+        materials = [
+            {
+                "role": response.agent_type.value,
+                "task": task.instruction,
+                "answer": response.content,
+            }
+            for (agent_type, task), response in results
         ]
-        qa_keywords = [
-            "为什么", "哪里错", "不理解", "怎么改", "报错",
-        ]
-        quiz_keywords = [
-            "出题", "练习", "考考我", "测验",
-        ]
+        prompt = (
+            "你是学习助手的答案整合器。请围绕用户原始请求，将下面多个角色的结果"
+            "整理成一份连贯答案。删除重复内容；若有冲突，优先保留有依据且更谨慎的"
+            "说法；不要暴露内部 Agent 名称、路由过程或整合过程；不要添加材料中没有"
+            "依据的事实。\n\n"
+            f"用户原始请求：{req.message}\n"
+            f"角色结果：{json.dumps(materials, ensure_ascii=False)}"
+        )
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                temperature=0.1,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = extract_text_content(response.content).strip()
+            if content:
+                return content
+            raise RuntimeError("答案整合器返回空内容")
+        except Exception as ex:
+            logger.warning("多 Agent 答案整合失败，使用本地去重结果: %s", ex)
+            return self._deduplicate_responses(
+                [response for _, response in results]
+            )
 
-        if (req.intent == IntentCategory.EXPLAIN or
-            any(keyword in msg for keyword in explain_keywords)
-        ):
-            targets.append(AgentType.EXPLAIN)
-
-        if (req.intent == IntentCategory.QA
-            or any(keyword in msg for keyword in qa_keywords)
-        ):
-            targets.append(AgentType.QA)
-
-        if (req.intent == IntentCategory.QUIZ
-            or any(keyword in msg for keyword in quiz_keywords)
-        ):
-            targets.append(AgentType.QUIZ)
-
-        # 保持顺序去重，并只返回当前有实例的 Agent 类型。
-        deduped = list(dict.fromkeys(targets))
-        return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+    @staticmethod
+    def _deduplicate_responses(responses: List[AgentResponse]) -> str:
+        """整合模型不可用时，按段落规范化去重，避免直接原样拼接。"""
+        unique = []
+        seen = set()
+        for response in responses:
+            for paragraph in response.content.split("\n\n"):
+                cleaned = paragraph.strip()
+                key = "".join(cleaned.lower().split())
+                if cleaned and key not in seen:
+                    unique.append(cleaned)
+                    seen.add(key)
+        return "\n\n".join(unique) or "学习服务暂时不可用，请稍后重试。"
 
     def _best_agent(self, agent_type: AgentType) -> Optional[BaseAgent]:
         """

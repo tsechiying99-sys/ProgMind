@@ -2,24 +2,38 @@
 从课程知识库中筛选明确属于题目或练习的内容。
 """
 
+import os
 from typing import Any, Dict
 
 from mcp.tool_manager import Tool
 from tools.contracts import object_schema
 
 
-def create_tool(knowledge_base: Any) -> Tool:
+def create_tool(knowledge_base: Any, tool_manager: Any = None) -> Tool:
     async def handle(params: Dict[str, Any], context: Any):
+        top_k = params.get("top_k", 5)
         candidates = await knowledge_base.search_handler({
             "query": params["query"],
-            "top_k": min(params.get("top_k", 5) * 3, 24),
+            "top_k": min(top_k * 3, 24),
             "retrieval_mode": "hybrid",
         }, context)
         markers = ("练习", "题目", "习题", "quiz", "question")
         questions = [
             item for item in candidates
             if any(marker in f"{item.get('title', '')} {item.get('content', '')}".lower() for marker in markers)
-        ][:params.get("top_k", 5)]
+        ]
+        rerank_enabled = (
+            os.getenv("RAG_LLM_RERANK_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if questions and rerank_enabled and tool_manager is not None:
+            questions = await tool_manager.rerank_results(
+                params["query"],
+                questions,
+                top_k,
+            )
+        else:
+            questions = questions[:top_k]
         return {
             "configured": bool(questions),
             "questions": questions,

@@ -37,6 +37,13 @@ export interface KnowledgeImportResponse {
   message: string;
   added_chunks: number;
   total_chunks: number;
+  document_id?: string;
+  pages?: number;
+  native_pages?: number;
+  ocr_pages?: number;
+  hybrid_pages?: number;
+  quality_score?: number;
+  warnings?: string[];
 }
 
 export interface KnowledgeStats {
